@@ -11,3 +11,4 @@ results/
 *.log
 .DS_Store
 .ipynb_checkpoints/
+acl_latex.tex
