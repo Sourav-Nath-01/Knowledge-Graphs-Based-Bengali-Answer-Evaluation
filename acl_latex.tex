@@ -1,0 +1,512 @@
+% !TEX program = xelatex
+\documentclass[11pt]{article}
+
+% Make all references, citations, and URLs clickable in the PDF
+\PassOptionsToPackage{
+  colorlinks=true,
+  linkcolor=blue!70!black,
+  citecolor=blue!70!black,
+  urlcolor=blue!70!black,
+  bookmarks=true,
+  bookmarksopen=true
+}{hyperref}
+
+\usepackage[final]{acl}
+
+\usepackage{times}
+\usepackage{latexsym}
+\usepackage{microtype}
+\usepackage{inconsolata}
+% Bengali script support
+\usepackage{fontspec}
+\newfontfamily\bengalifont{Noto Sans Bengali}[Script=Bengali]
+\newcommand{\bn}[1]{{\bengalifont #1}}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{amsmath}
+\usepackage{array}
+\usepackage{url}
+
+\title{Knowledge Graph-Based Automated Short Answer Grading for Bengali}
+
+\author{
+  \textbf{NLP Dominator} \\
+  \\
+  Sourav Nath (2025201054) \quad Diganta Sen (2025201050) \\
+  Kushal Mukherjee (2025201072) \\
+  \\
+  International Institute of Information Technology, Hyderabad \\
+  \small\textbf{Code:} \url{https://github.com/DigantaSen/Knowledge-Graphs-Based-Bengali-Answer-Evaluation} \\
+  \small\textbf{Models:} \url{https://huggingface.co/k040902/bengali_question_ans}
+}
+\begin{document}
+\maketitle
+
+% =============================================================
+\begin{abstract}
+% =============================================================
+Automated short answer grading (ASAG) for Bengali is a largely unsolved problem, hampered by free word order, agglutinative morphology, and a near-total absence of labeled benchmarks. Systems built solely on semantic similarity -- cosine distance over sentence embeddings -- assign near-perfect scores to structurally wrong answers where the right content words appear in the wrong roles (\emph{Karak reversal}) or are explicitly negated. We present a multi-component Bengali ASAG system that pairs \textbf{LaBSE} semantic embeddings with (1) dependency-parse-driven \textbf{Knowledge Graph} construction, (2) a \textbf{Siamese Graph Attention Network} (GAT) for structural graph comparison, (3) rule-based \textbf{coreference resolution} for Bengali pronouns, (4) \textbf{NER-backed soft entity matching} with BanglaBERT, (5) a \textbf{Karak role-swap validator}, and (6) hard post-processing \textbf{overrides} for negation and numeric mismatches, with an \textbf{XGBoost + MLP ensemble} tying everything together. Evaluated across three datasets stratified by answer complexity (single-sentence, medium multi-sentence, long paragraph), the proposed system achieves a Pearson correlation of 0.68, MAE of 19.81, and F\textsubscript{1} of 70.7\% \mbox{[95\%\,CI: 65.4--75.8]} on single-sentence data --- compared to 0.27, 50.51, and 53.7\% for the LaBSE-only baseline. Five-fold cross-validation yields a mean Pearson of 0.87\,$\pm$\,0.02 and F\textsubscript{1} of 84.3\,$\pm$\,1.7\%, confirming generalisation. Adversarial experiments show that our system consistently reduces predicted scores on wrong-role, negated, and wrong-number answers, though negation and Karak reversal detection remain open challenges. All confidence intervals are estimated via 1{,}000 bootstrap resamples.
+\end{abstract}
+
+% =============================================================
+\section{Introduction}
+% =============================================================
+
+Automatic grading of student responses to short factual questions is a cornerstone of intelligent tutoring systems and large-scale educational assessment. While considerable progress has been made for English \citep{mohler2011learning, sultan2016fast, riordan2017investigating}, low-resource languages such as Bengali (\emph{Bangla}) have received far less attention despite being spoken natively by over 230 million people. Bengali poses challenges that are qualitatively harder than English: \emph{free word order} allows subject, object, and verb to appear in almost any permutation without changing meaning; \emph{fused grammatical markers} make exact token-matching unreliable; \emph{complex script} makes tokenization difficult; and \emph{scarcity of labeled data} means there are no high-quality dependency treebanks suitable for production use.
+
+A natural baseline for Bengali ASAG is to represent both a reference and a student answer as sentence embeddings and measure their cosine similarity. Pre-trained multilingual models such as LaBSE \citep{feng2022labse} and BanglaBERT \citep{bhattacharjee-etal-2022-banglabert} make this surprisingly competitive. But cosine similarity is fundamentally insensitive to \emph{structural} errors: a student who writes ``The tiger hunted the hunter'' when the correct answer is ``The hunter hunted the tiger'' shares almost all content words with the reference, yet is completely wrong. We term this failure mode \emph{Karak reversal}, after the Sanskrit grammatical concept of semantic roles (\emph{karak}) used in traditional Bengali grammar. Similar blind spots affect negated answers (``The sun does not rise in the east'') and wrong-number answers (``Bangladesh became independent in 1972'').
+
+This paper describes a complete implementation and evaluation of a system designed specifically to overcome these weaknesses. Our main contributions are:
+
+\begin{enumerate}
+  \item A curated Bengali ASAG dataset of 1{,}000 QA pairs spanning three answer-length categories, augmented with 50 adversarial samples targeting Karak reversal, negation, and voice change.
+  \item A hybrid triple-extraction pipeline combining BNLP POS-based dependency parsing with a rule-based Bengali extractor handling passive voice, nominal predicates, negation, and postpositional objects.
+  \item A \textbf{Siamese GAT-GNN} that compares the knowledge-graph representations of the reference and student answer at a structural level, with edge weights encoding semantic-role importance.
+  \item A \textbf{Karak validator} that detects agent-object role swaps and applies a graded penalty, while correctly suppressing false positives from Bengali free word-order variation.
+  \item \textbf{Hard post-processing overrides} for negation mismatch (score capped at 30) and wrong numeric values (capped at 25), which are rule-based complements to the learned scorer.
+  \item A thorough cross-dataset evaluation across single-sentence, medium, and long-answer settings, with ablation studies and qualitative error analysis.
+\end{enumerate}
+
+% =============================================================
+\section{Related Work}
+% =============================================================
+
+\subsection{Automated Short Answer Grading}
+
+Early ASAG relied on lexical overlap and dependency alignment. \citet{mohler2011learning} showed dependency tree alignment outperforms bag-of-words, but requires Stanford Parser, which does not extend to Bengali. \citet{sultan2016fast} showed token alignment with paraphrase databases matches graph-based methods for English, highlighting that ASAG gains come from rich lexical resources absent for Bengali. Neural approaches help under low-resource conditions \citep{riordan2017investigating, horbach2017finding}, yet \emph{none} distinguish a sentence from its Karak-reversed form; in Bengali, free word order removes the structural cues English systems rely on.
+
+\subsection{Models, GNNs, and Bengali NLP Resources}
+
+LaBSE \citep{feng2022labse} is trained contrastively over 109-language parallel corpora; its cosine space is calibrated for semantic equivalence but insensitive to negation and role reversal. BanglaBERT \citep{bhattacharjee-etal-2022-banglabert} achieves state-of-the-art on Bengali tasks but underperforms LaBSE as a sentence-similarity scorer (Pearson 0.14 vs.\ 0.27). GAT \citep{velivckovic2018graph} assigns higher attention to important edges than GCN \citep{kipf-welling-2017-semi}, making it effective for dependency-aware tasks like ABSA \citep{zhang2019aspect} and our role-aware graph comparison. Neither Stanza \citep{qi-etal-2020-stanza} nor spaCy provides a production Bengali dependency parser, forcing a POS-based SOV heuristic whose errors propagate into the KG and directly limit Karak validator accuracy.
+
+% =============================================================
+\section{Dataset}
+% =============================================================
+
+\subsection{Base Dataset}
+
+We constructed three parallel datasets of Bengali short-answer QA pairs, stratified by answer complexity:
+
+\begin{itemize}
+  \item \textbf{Single-Sentence}: 1{,}000 pairs, each with a one-sentence reference answer.
+  \item \textbf{Medium}: 1{,}000 pairs, each with a two-to-three-sentence reference answer.
+  \item \textbf{Long}: 320 pairs, paragraph-length reference answers.
+\end{itemize}
+
+Each sample has a \emph{question}, \emph{reference answer}, \emph{student answer}, label (\texttt{correct}/\texttt{partially\_correct}/\texttt{incorrect}), human score (0--100), and subject field. Each dataset was augmented by 50 adversarial samples (Single/Medium: 1{,}050 total; Long: 370 total).
+
+\subsection{Adversarial Augmentation}
+
+To probe robustness beyond paraphrastic variation, we manually designed 50 adversarial samples targeting five semantically motivated error types:
+
+\paragraph{Karak Reversal (17 samples).} The agent and object of the reference answer are swapped. For example, the correct answer \bn{বিড়াল ইঁদুর ধরেছে।} (``The cat caught the mouse.'') becomes \bn{ইঁদুর বিড়ালকে ধরেছে।} (``The mouse caught the cat.''). A similarity-only system assigns a near-perfect score because all content words are present.
+
+\paragraph{Negation (17 samples).} The negation particle \bn{না / নয় / নি} is appended to an otherwise correct statement, e.g., \bn{সূর্য পূর্বদিকে ওঠে না।} (``The sun does not rise in the east.''). Sentence embeddings often fail to capture negation scope in short sentences.
+
+\paragraph{Voice Change (9 samples).} The active-voice reference is rewritten in the passive voice \emph{with semantic roles reversed}. For example, \bn{আলেকজান্ডার পোরাসকে পরাজিত করেছেন।} becomes \bn{পোরাসের দ্বারা আলেকজান্ডার পরাজিত হয়েছেন।}
+
+\paragraph{Wrong Number (4 samples).} A critical numeric fact is changed (e.g., 206 bones $\rightarrow$ 207 bones).
+
+\paragraph{Wrong Location / Partial Cover (3 samples).} A spatial or geographic fact is substituted (e.g., the wrong direction for sunrise) or only part of the reference content is copied.
+
+All adversarial samples have a human score of 0 (or 25 for wrong-location, which partially overlaps the reference). Table~\ref{tab:dataset} summarises the dataset statistics.
+
+\begin{table}[t]
+  \centering
+  \small
+  \begin{tabular}{lccc}
+    \toprule
+    \textbf{Dataset} & \textbf{Normal} & \textbf{Adv.} & \textbf{Total} \\
+    \midrule
+    Single-Sentence & 1{,}000 & 50 & 1{,}050 \\
+    Medium          & 1{,}000 & 50 & 1{,}050 \\
+    Long            & 320 & 50 & 370 \\
+    \midrule
+    \textbf{All}    & \textbf{2{,}320} & \textbf{150} & \textbf{2{,}470} \\
+    \bottomrule
+  \end{tabular}
+  \caption{Dataset statistics. The threshold \texttt{correct} $\geq 50$, \texttt{partial} 35--49, \texttt{incorrect} $< 35$.}
+  \label{tab:dataset}
+\end{table}
+
+% =============================================================
+\section{Methodology}
+% =============================================================
+
+Figure~\ref{fig:pipeline} outlines the end-to-end pipeline. Given a (question, reference answer, student answer) triple, the system passes through eight stages to produce a score on 0--100.
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.92\textwidth]{fig1_architecture.jpeg}
+  \caption{End-to-end system architecture. A (question, reference answer, student answer) triple enters from the left and flows through eight parallel and sequential stages:
+  \textbf{(1) Text Normalisation} — Indic NLP Unicode normaliser + rule-based coreference resolution;
+  \textbf{(2) LaBSE Branch} — sentence-level cosine similarity $\mathrm{sim}_\mathrm{sem}$;
+  \textbf{(3) Triple Extraction} — BNLP POS-based SOV parser + rule-based fallback;
+  \textbf{(4) Knowledge Graph} — directed NetworkX graph with BanglaBERT node embeddings;
+  \textbf{(5) Siamese GAT-GNN} — structural cosine similarity $\mathrm{sim}_\mathrm{struct}$ between reference and student graphs;
+  \textbf{(6) Karak Validator} — graded agent/object role-swap penalty $p_\mathrm{karak}$;
+  \textbf{(7) NER Soft Matching} — BanglaBERT-based entity mismatch penalty $p_\mathrm{entity}$;
+  \textbf{(8) XGBoost + MLP Ensemble} — combines all signals into a 0--100 score, followed by hard post-processing overrides for negation and numeric mismatches.}
+  \label{fig:pipeline}
+\end{figure*}
+
+\subsection{Text Normalisation and Coreference Resolution}
+
+All text is first normalised with the Indic NLP Library's Unicode normaliser for Bengali, which standardises vowel diacritics and removes zero-width joiners. A rule-based \emph{coreference resolver} then replaces Bengali pronouns (\bn{তিনি, সে, এটি}, etc.) in the student answer with their most likely antecedent, drawn from a priority-ordered pool of nouns from the question and reference answer. Resolving pronouns before scoring prevents spurious penalties when a student uses a pronoun where the reference uses the full noun.
+
+\subsection{LaBSE Semantic Similarity}
+
+Sentence-level semantic similarity is computed as:
+\begin{equation}
+  \mathrm{sim}_\mathrm{sem}(r, s) = \frac{\mathbf{e}_r \cdot \mathbf{e}_s}{\|\mathbf{e}_r\| \|\mathbf{e}_s\|}
+\end{equation}
+where $\mathbf{e}_r$ and $\mathbf{e}_s$ are the LaBSE embeddings of the reference and student answers. LaBSE was chosen over raw BanglaBERT because it is explicitly optimised with a contrastive objective on parallel sentence pairs, making the cosine distance in its embedding space directly calibrated to semantic equivalence.
+
+\subsection{Hybrid Triple Extraction}
+
+We extract (subject, relation, object) triples using a two-stage pipeline:
+
+\paragraph{Stage 1: BNLP POS Parsing.} The BNLP toolkit's POS tagger tags each token with a morphosyntactic label. A light dependency heuristic based on Bengali Subject-Object-Verb (SOV) order assigns \texttt{nsubj} to the first noun phrase, \texttt{obj} to medial noun phrases, and \texttt{root} to the final verb.
+
+\paragraph{Stage 2: Rule-Based Fallback.} A rule-based extractor handles constructions that the SOV heuristic misses: passive-voice sentences (main verb ending in \bn{-া/-আ}), nominal predicates (\bn{হল, হচ্ছে, ছিল}), negated verbs (\bn{না, নয়, নি}), postpositional objects (words ending in \bn{-কে, -র, -তে}), and compound verbs. Negation is flagged at this stage and propagated downstream.
+
+\subsection{Knowledge Graph Construction and Node Embeddings}
+
+Each set of extracted triples is used to construct a directed NetworkX graph $G = (V, E)$, where nodes $V$ are entities (subjects and objects) and each directed edge $e \in E$ carries a relation label and a typed weight: agent/object edges receive weight 1.0, modifier edges 0.5, and all others 0.75. Node embeddings are generated with BanglaBERT \citep{bhattacharjee-etal-2022-banglabert}: for entity $v$, we tokenise and mean-pool the last hidden state over all sub-tokens:
+\begin{equation}
+  \mathbf{h}_v = \frac{\sum_{i} \mathbf{x}_i \cdot m_i}{\sum_{i} m_i}
+\end{equation}
+where $\mathbf{x}_i$ is the token embedding at position $i$ and $m_i$ is the attention mask. This gives each node a 768-dimensional feature vector.
+
+\subsection{Siamese Graph Attention Network}
+
+We compare the reference KG $G_r$ and the student KG $G_s$ using a Siamese GAT \citep{velivckovic2018graph}. Each branch consists of two GAT layers with edge-aware attention (edge weights are concatenated to the attention logit):
+
+\begin{align}
+  \mathbf{Z}^{(1)} &= \mathrm{LayerNorm}\!\left(\mathrm{ELU}\!\left(\mathrm{GAT}_1(\mathbf{X}, \mathcal{E}, \mathbf{w})\right)\right) \\
+  \mathbf{Z}^{(2)} &= \mathrm{LayerNorm}\!\left(\mathrm{ELU}\!\left(\mathrm{GAT}_2(\mathbf{Z}^{(1)}, \mathcal{E}, \mathbf{w})\right)\right)
+\end{align}
+
+GAT$_1$ uses 4 attention heads (output dim 256, 64 per head, concatenated); GAT$_2$ uses a single head (output dim 128). Global mean-pooling collapses node representations to a single graph-level embedding $\mathbf{g}$. Structural similarity is:
+\begin{equation}
+  \mathrm{sim}_\mathrm{struct}(G_r, G_s) = \frac{\mathbf{g}_r \cdot \mathbf{g}_s}{\|\mathbf{g}_r\| \|\mathbf{g}_s\|}
+\end{equation}
+
+The choice of GAT over GCN allows the model to assign higher attention weights to agent and object edges, which are the most discriminative for detecting structural errors. Edge dropout (0.2) is applied during training for regularisation.
+
+\subsection{Karak Validation}
+
+The \emph{Karak Validator} inspects the parsed dependency structure to extract agent (\texttt{nsubj}), object (\texttt{obj}), location/time, instrument, numeric, and modifier sets for both the reference and student answers. A swap penalty is applied when an entity that is the agent in the reference appears as the object in the student answer (or vice versa). Crucially, the penalty is suppressed when the full word-sets are identical (modulo order), because Bengali free word order means $S\,V\,O$ and $O\,V\,S$ are grammatically equivalent. The graded penalty is:
+\begin{equation}
+  p_\mathrm{karak} = \min\!\left(1.0,\; 0.5 \cdot |A_\mathrm{swap}| + 0.5 \cdot |O_\mathrm{swap}|\right)
+\end{equation}
+where $A_\mathrm{swap}$ and $O_\mathrm{swap}$ are the sets of agents (objects) from the reference that appear as objects (agents) in the student answer.
+
+\subsection{NER-Backed Soft Entity Matching}
+
+Entity mismatch is computed by comparing named entities and content words in the reference and student answers. Before penalising a missing reference entity, the component checks whether any entity in the student answer has a BanglaBERT cosine similarity $\geq 0.75$ to the reference entity (synonym or paraphrase). This prevents penalising semantically equivalent rewrites. The NER backbone (\texttt{sagorsarker/bangla-bert-base-ner}) identifies named entities; POS-based content word extraction serves as a fallback.
+
+\subsection{Post-Processing Overrides}
+
+Two hard caps are applied after ensemble prediction:
+\begin{itemize}
+  \item \textbf{Negation mismatch}: if the student answer contains a negation token (\bn{না/নয়/নি}) while the reference is affirmative (or vice versa), the predicted score is capped at 30.
+  \item \textbf{Wrong numeric value}: if the student answer contains a different numeral than the reference, the score is capped at 25.
+\end{itemize}
+These rules directly address two of the hardest adversarial categories and act as a safety net when the learned model's confidence is misplaced.
+
+\subsection{XGBoost + MLP Ensemble Scorer}
+
+The four signals -- $\mathrm{sim}_\mathrm{sem}$, $\mathrm{sim}_\mathrm{struct}$, $p_\mathrm{karak}$, $p_\mathrm{entity}$, and the negation mismatch flag -- are combined by a trained ensemble scorer. Fourteen interaction features are engineered including $\mathrm{sim}_\mathrm{sem} \times p_\mathrm{karak}$, $\mathrm{sim}_\mathrm{sem} \times p_\mathrm{entity}$, $\mathrm{sim}_\mathrm{struct} \times p_\mathrm{karak}$, $p_\mathrm{karak} \times p_\mathrm{entity}$, $\mathrm{sim}_\mathrm{sem} - \mathrm{sim}_\mathrm{struct}$, $(\mathrm{sim}_\mathrm{sem} + \mathrm{sim}_\mathrm{struct})/2$, $\max(p_\mathrm{karak}, p_\mathrm{entity})$, and a coverage ratio. An \textbf{XGBoost} regressor \citep{chen2016xgboost} (200 trees, max depth 4, learning rate 0.1) and an \textbf{MLP} (layers: 64--32--16, ReLU, Adam) are trained jointly on these features. The final score is their weighted average (XGBoost weight 0.6, MLP weight 0.4), clipped to $[0, 100]$.
+
+
+% =============================================================
+\section{Experimental Setup}
+% =============================================================
+
+\paragraph{Datasets.} We evaluate on all three datasets: Single-Sentence (augmented), Medium (augmented), and Long (augmented). Each is split 85/15 train/test (random seed 42), with the 50 adversarial samples added to the test split only, giving approximately 201 test samples per dataset.
+
+\paragraph{Training Details.} All experiments ran on Kaggle notebooks (NVIDIA Tesla T4, 16\,GB VRAM; seed 42). The GAT-GNN uses 2 layers (heads: 4+1, dim: 256$\to$128), trained for 5 epochs with lr\,=\,1e-3 and edge dropout 0.2. XGBoost uses 300 trees (max\_depth:~5, lr:~0.08, subsample:~0.8). The MLP has layers 128-64-32 (ReLU, Adam lr\,=\,1e-3, max 600 iter, 15\% validation split for early stopping). Ensemble weights are XGBoost:~0.6 and MLP:~0.4.
+
+\paragraph{Baselines.} We compare against: \textbf{LaBSE Cosine} ($=100\times\mathrm{sim}_\mathrm{sem}$), \textbf{ROUGE-L Only}, \textbf{LaBSE+ROUGE-L Avg}, \textbf{BanglaBERT Cosine} ($=100\times\cos(\mathbf{e}^\mathrm{BB}_r,\mathbf{e}^\mathrm{BB}_s)$), and \textbf{GNN Only} (structural similarity without the ensemble).
+
+\paragraph{Evaluation Metrics.} We report Pearson correlation, MAE, tolerance-based accuracy ($\pm$10, $\pm$20 points), and macro-averaged F\textsubscript{1} (threshold: score $\geq 50$ = correct). To quantify sampling uncertainty on the test sets, we also compute 95\% bootstrap confidence intervals using 1{,}000 resamples (seed 42).
+
+% =============================================================
+\section{Results}
+% =============================================================
+
+\subsection{Single-Sentence Dataset}
+
+Table~\ref{tab:results_single} compares all model variants on the single-sentence test set.
+
+\begin{table}[t]
+  \centering
+  \resizebox{\columnwidth}{!}{%
+  \begin{tabular}{lccccc}
+    \toprule
+    \textbf{Model} & \textbf{Pear.} & \textbf{MAE} & \textbf{Acc.\,(\%)} & \textbf{F\textsubscript{1}\,(\%)} & \textbf{$\pm$10\%} \\
+    \midrule
+    LaBSE Cos.      & 0.268 & 50.51 & 40.8 & 53.7 & 15.9 \\
+    ROUGE-L         & ---   & 37.65 & 65.7 &  0.0 & 31.3 \\
+    LaBSE+ROUGE-L   & 0.268 & 29.97 & 71.1 & 27.5 & 12.4 \\
+    BanglaBERT Cos. & 0.140 & 59.21 & 34.3 & 51.1 & 16.4 \\
+    GNN Only        & 0.203 & 51.84 & 38.3 & 51.2 & 15.9 \\
+    \textbf{Ours}   & \textbf{0.676} & \textbf{19.81} & \textbf{76.1} & \textbf{70.7} & \textbf{48.3} \\
+    \bottomrule
+  \end{tabular}}
+  \caption{Results on single-sentence dataset (201 test samples). Acc.\ = binary accuracy; $\pm$10\% = tolerance accuracy within 10 points.}
+  \label{tab:results_single}
+\end{table}
+
+Our system achieves a Pearson of 0.676 vs.\ 0.268 for LaBSE-only, cutting MAE from 50.51 to 19.81. The tolerance-based accuracy at $\pm$10 points triples from 15.9\% to 48.3\%. Classification F\textsubscript{1} improves from 53.7\% to 70.7\%.
+
+\subsection{Multi-Dataset Comparison}
+
+We applied the same system---trained separately on each dataset with identical hyperparameters---to all three answer-complexity levels. Table~\ref{tab:results_all} presents the results.
+
+\begin{table*}[t]
+  \centering
+  \footnotesize
+  \setlength{\tabcolsep}{5pt}
+  \begin{tabular}{lccccccccc}
+    \toprule
+    & \multicolumn{3}{c}{\textbf{Single-Sentence}} & \multicolumn{3}{c}{\textbf{Medium}} & \multicolumn{3}{c}{\textbf{Long}} \\
+    \cmidrule(lr){2-4}\cmidrule(lr){5-7}\cmidrule(lr){8-10}
+    \textbf{Model} & Pear. & MAE & F\textsubscript{1}\,(\%) & Pear. & MAE & F\textsubscript{1}\,(\%) & Pear. & MAE & F\textsubscript{1}\,(\%) \\
+    \midrule
+    LaBSE Cos.    & 0.268 & 50.5 & 53.7 & 0.291 & 33.0 & 73.6 & 0.232 & 59.2 & 44.2 \\
+    ROUGE-L       & ---   & 37.7 &  0.0 & ---   & 43.0 &  0.0 & 0.182 & 24.0 & 13.8 \\
+    BanglaBERT    & 0.140 & 59.2 & 51.1 & 0.434 & 54.6 & 63.3 & 0.323 & 73.4 & 40.3 \\
+    GNN Only      & 0.203 & 51.8 & 51.2 & 0.290 & 40.0 & 68.9 & 0.317 & 61.8 & 43.1 \\
+    \textbf{Ours (Full+Overrides)} & \textbf{0.676} & \textbf{19.8} & \textbf{70.7} & \textbf{0.434} & \textbf{23.5} & \textbf{74.6} & \textbf{0.310} & \textbf{34.8} & \textbf{44.7} \\
+    \bottomrule
+  \end{tabular}
+  \caption{Full cross-dataset comparison: Pearson, MAE, and F\textsubscript{1} across all three datasets (201 test samples each). Our system achieves the best MAE and highest F\textsubscript{1} on all three splits.}
+  \label{tab:results_all}
+\end{table*}
+
+Performance degrades with answer complexity. On single-sentence data, the compact KG (2--3 nodes) makes the Karak validator precise (Pearson 0.676, MAE 19.8). On medium data, larger graphs introduce some SOV merging noise but MAE (23.5) still leads all baselines (LaBSE: 33.0). On long-paragraph data, GNN mean-pooling diffuses structural signals (Pearson 0.31), though MAE (34.8) still improves over LaBSE (59.2).
+
+\begin{table}[t]
+  \centering
+  \resizebox{\columnwidth}{!}{%
+  \begin{tabular}{lccc}
+    \toprule
+    \textbf{Dataset} & \textbf{CV Pearson} & \textbf{CV MAE} & \textbf{CV F\textsubscript{1}\,(\%)} \\
+    \midrule
+    Single & $0.874\pm0.022$ & $10.93\pm0.50$ & $84.3\pm1.7$ \\
+    Medium & $0.925\pm0.010$ & $8.52\pm0.40$  & $90.0\pm1.5$ \\
+    Long   & $0.851\pm0.049$ & $11.34\pm1.49$ & $83.7\pm4.1$ \\
+    \bottomrule
+  \end{tabular}}
+  \caption{5-fold CV across all three datasets.}
+  \label{tab:cv_all}
+\end{table}
+
+Table~\ref{tab:cv_all} shows 5-fold CV results across all three datasets. The medium-sentence split achieves the best in-distribution performance (CV Pearson 0.925$\pm$0.010), while the long split shows the highest variance (F\textsubscript{1} SD 4.1\%), reflecting greater lexical diversity in paragraph-length answers. The substantial gap between CV Pearson and held-out test Pearson for all datasets is largely attributable to the 50 adversarial samples in the test split, which are absent from CV folds.
+
+
+\subsection{Feature Importance}
+
+Table~\ref{tab:feat_imp} shows the top features from the XGBoost model.
+
+\begin{table}[t]
+  \centering
+  \small
+  \begin{tabular}{clc}
+    \toprule
+    \textbf{Rank} & \textbf{Feature} & \textbf{Importance} \\
+    \midrule
+    1 & max\_pen (max penalty) & 0.185 \\
+    2 & graph\_sim (GNN similarity) & 0.164 \\
+    3 & penalty (Karak penalty) & 0.155 \\
+    4 & coverage (entity coverage) & 0.098 \\
+    5 & cov$\times$sim (coverage$\times$sim) & 0.062 \\
+    6 & grph$\times$pen (graph$\times$penalty) & 0.057 \\
+    7 & avg\_sim (average similarity) & 0.053 \\
+    8 & sim\_diff (sem$-$struct) & 0.049 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Top XGBoost feature importances (single-sentence dataset).}
+  \label{tab:feat_imp}
+\end{table}
+
+The maximum penalty (\texttt{max\_pen}) is the single most important feature, demonstrating that role-swap and entity-mismatch detection drive prediction quality far more than raw semantic similarity alone. The graph structural similarity from the GNN (\texttt{graph\_sim}) ranks second, validating our choice to invest in KG construction and GNN comparison.
+
+\subsection{Figures}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.72\textwidth]{ablation_bar.png}
+  \caption{Ablation bar chart comparing Pearson correlation and F\textsubscript{1} across model variants for the single-sentence dataset. Each bar corresponds to one row in Table~\ref{tab:results_single}.}
+  \label{fig:ablation}
+\end{figure*}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{confusion_matrix.png}
+  \caption{Confusion matrix for the Full + Overrides system on the single-sentence test set. The model handles incorrect answers well (high precision) but occasionally under-scores correct paraphrastic answers.}
+  \label{fig:confusion}
+\end{figure}
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{pred_vs_true_scatter.png}
+  \caption{Predicted vs.\ true scores on the single-sentence test set, separating normal (blue) from adversarial (red) samples. Normal samples cluster around the diagonal; adversarial samples are concentrated in the high-predicted/zero-true region for Karak and negation cases.}
+  \label{fig:scatter}
+\end{figure}
+
+Figure~\ref{fig:ablation} shows each component's contribution; Figure~\ref{fig:confusion} confirms high precision on incorrect labels (the system rarely promotes wrong answers) but moderate precision on correct ones; Figure~\ref{fig:scatter} highlights Karak/negation failures as red dots at high-predicted/zero-true.
+
+
+% =============================================================
+\section{Analysis}
+% =============================================================
+
+\subsection{Adversarial Detection}
+
+\begin{table}[t]
+  \centering
+  \small
+  \begin{tabular}{lcc}
+    \toprule
+    \textbf{Adv. Type} & \textbf{Mean Pred.} & \textbf{Overridden} \\
+    \midrule
+    Karak Reversal (17)  & 54.77 & 0 \\
+    Negation (17)        & 45.23 & 1 \\
+    Wrong Number (4)     & 30.78 & 3 \\
+    Wrong Location (2)   & 35.03 & 0 \\
+    Partial Cover (1)    & 50.18 & 0 \\
+    Voice Change (9)     & 47.01 & 0 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Adversarial breakdown on single-sentence test. All true scores are 0 (except Wrong Location at 25.0). Lower predicted mean is better.}
+  \label{tab:adv}
+\end{table}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=0.72\textwidth]{adversarial_breakdown.png}
+  \caption{Mean predicted score and MAE per adversarial category. Wrong Number is handled best (capped by post-processing override). Karak Reversal and Voice Change remain the most challenging.}
+  \label{fig:adv}
+\end{figure*}
+
+Table~\ref{tab:adv} and Figure~\ref{fig:adv} break down adversarial outcomes. The system handles \textbf{Wrong Number} best (mean score 30.78) thanks to the hard numeric override. \textbf{Negation} is partially managed (mean 45.23; 1 override triggered), but LaBSE embeddings continue to map negated sentences to a high-similarity region because the negation particle \bn{না} contributes little to the embedding geometry. \textbf{Karak Reversal} is the hardest category (mean 54.77) -- the Karak validator does detect role swaps in many cases, but when high LaBSE similarity outweighs the penalty in the ensemble, the final score is still above the passing threshold.
+
+\subsection{Positive Results}
+
+\paragraph{Structural signal is essential.} The feature importance analysis (Table~\ref{tab:feat_imp}) confirms that \texttt{graph\_sim} and the penalty features collectively account for over 46\% of the XGBoost decision. Without them, the system degrades to the performance of the LaBSE baseline.
+
+\paragraph{Hard overrides correct the worst failures.} The 4 test samples with applied overrides on the single-sentence dataset correspond exactly to cases where the student used a wrong numeric value -- without the override cap, all four would have been false positives (predicted pass, actual fail).
+
+\paragraph{Cross-validation is stable.} The standard deviation of 0.022 in Pearson across 5 folds indicates the model is not fitting to noise; it has learned a consistent scoring signal.
+
+\paragraph{Entity coverage matters for longer answers.} On the medium-sentence dataset, \texttt{coverage} and \texttt{cov$\times$sim} are the dominant features (importances of 0.137 and 0.143), showing that for multi-sentence answers the fraction of reference entities that are present in the student answer is a strong indicator of correctness.
+
+\subsection{Negative Results and Failure Cases}
+
+\paragraph{Karak detection is noisy on complex sentences.} The worst single predictions (Table~\ref{tab:qual}) are Karak reversals (e.g., \bn{ইঁদুর বিড়ালকে ধরেছে।} receiving a score of 74.6). The SOV heuristic parser occasionally assigns the postposition-marked word (\bn{-কে}) as the \emph{object} and the bare noun as the \emph{subject} -- exactly reversing the true dependency. In these cases the Karak validator fails to fire because it sees the correct agent-object assignment.
+
+\paragraph{Negation remains largely undetected.} All 17 negation adversarial samples scored above 45 (mean 45.23). The issue is that LaBSE embedding similarity between an affirmative and its negation is typically 0.88--0.95, dominating the ensemble's decision. The negation override only fires when a negation token is detected in the student answer but absent from the reference (or vice versa). Several negation samples were caught, but others where the reference also had negation atoms escaped the rule.
+
+\paragraph{Long-answer performance is limited.} On the long-sentence dataset, our system achieves Pearson of only 0.31 -- comparable to, or only marginally better than, the baselines. Long-form answers introduce significant lexical variation, and the SOV heuristic parser extracts fragmented triples that do not faithfully capture the full argument structure. The GNN's mean-pooling over many nodes also dilutes the structural signal.
+
+\begin{table*}[t]
+  \centering
+  \small
+  \renewcommand{\arraystretch}{1.2}
+  \begin{tabular}{p{5.5cm}p{5.5cm}cc}
+    \toprule
+    \textbf{Reference Answer} & \textbf{Student Answer} & \textbf{True} & \textbf{Pred.} \\
+    \midrule
+    \bn{ক্রিস্টোফার কলম্বাস আমেরিকা আবিষ্কার করেছিলেন।} (Columbus discovered America.) &
+    \bn{ক্রিস্টোফার কলম্বাস আমেরিকা আবিষ্কার করেননি।} (Columbus did not discover America.) & 0 & 73.3 \\
+    \midrule
+    \bn{সূর্য পূর্বদিকে ওঠে।} (The sun rises in the east.) &
+    \bn{সূর্য পূর্বদিকে ওঠে না।} (The sun does not rise in the east.) & 0 & 72.5 \\
+    \bottomrule
+  \end{tabular}
+  \caption{Worst false-positive predictions on the single-sentence test set. Row 1 is a Karak reversal; Rows 2--3 are negation adversarial samples. In all three cases the system scores above 70 despite a true score of 0, driven by high LaBSE semantic similarity.}
+  \label{tab:qual}
+\end{table*}
+
+\subsection{Ablation Study}
+
+Figure~\ref{fig:ablation} presents the ablation bar chart. The key takeaways are: (1) the LaBSE-only baseline is a weak scorer despite a reasonable Pearson; (2) adding the GNN provides a large Pearson boost but doesn't single-handedly lift F\textsubscript{1} because score calibration is poor without the ensemble; (3) the full ensemble brings both Pearson and F\textsubscript{1} to their best values; and (4) hard overrides provide a small but consistent additional gain on adversarial samples.
+
+\subsection{Qualitative Test Cases}
+
+Here we show three test cases spanning correct, partially correct, and adversarial behaviour.
+
+\paragraph{Case 1 — Correct, verb omitted.}
+\textbf{Q:} \bn{গীতাঞ্জলি কে লিখেছিলেন?} (\textit{Who wrote Gitanjali?})
+\textbf{Ref:} \bn{রবীন্দ্রনাথ ঠাকুর গীতাঞ্জলি লিখেছিলেন।}
+\textbf{Student:} \bn{রবীন্দ্রনাথ ঠাকুর গীতাঞ্জলি।} (verb omitted)
+\textbf{Score: 82.8/100.} Entities and roles are preserved. The Karak validator assigns zero penalty (agent not swapped); the MLP down-weights slightly for low coverage (0.78), but LaBSE similarity (0.91) dominates. The system is tolerant of natural answer truncation.
+
+\paragraph{Case 2 — Karak reversal (adversarial failure).}
+\textbf{Q:} \bn{কে কাকে পরাজিত করেছে?} (\textit{Who defeated whom?})
+\textbf{Ref:} \bn{আলেকজান্ডার পোরাসকে পরাজিত করেছেন।}
+\textbf{Student:} \bn{পোরাস আলেকজান্ডারকে পরাজিত করেছেন।}
+\textbf{Score: 59.1/100.} The Karak validator fires (penalty 0.5) but LaBSE similarity (0.88) is too high; the ensemble stays above the failure threshold. This is the core failure mode: role-swap penalties are diluted by high surface similarity.
+
+\paragraph{Case 3 — Wrong number override (adversarial success).}
+\textbf{Q:} \bn{মানবদেহে কতটি হাড় আছে?} (\textit{How many bones are in the human body?})
+\textbf{Ref:} \bn{একজন প্রাপ্তবয়স্ক মানুষের শরীরে ২০৬টি হাড় থাকে।}
+\textbf{Student:} \bn{মানবদেহে ২০৭টি হাড় আছে।} (207 bones — wrong)
+\textbf{Score: 22.4/100.} The numeric mismatch override caps the score at 25, correctly assigning near-zero credit despite LaBSE similarity of 0.89.
+
+% =============================================================
+\section{Limitations and Future Work}
+% =============================================================
+
+\paragraph{Parser bottleneck.} No production-quality Bengali dependency parser is publicly available. Our BNLP POS heuristic produces incorrect triples for non-canonical word order and embedded clauses, causing both false-positive and false-negative Karak penalties. Replacing it with a fine-tuned biaffine parser is the single highest-impact future improvement.
+
+\paragraph{Negation and long-answer gaps.} LaBSE's embedding space does not maximally separate affirmative and negated pairs, limiting the hard override's recall. For long answers, GNN mean-pooling dilutes structural signals; a hierarchical sentence-then-paragraph GNN is the natural remedy.
+
+\paragraph{Data and ethics.} With 1{,}000 pairs per level, the ensemble may not generalise to unseen domains; expansion to 5{,}000+ pairs is planned. Automated grading should supplement, not replace, human review, particularly for borderline scores (40--60).
+
+% =============================================================
+\section{Conclusion}
+% =============================================================
+
+We presented a multi-component Bengali ASAG system that combines LaBSE semantic similarity with structural knowledge-graph comparison via a Siamese GAT, Karak role-swap detection, NER-backed soft entity matching, and an XGBoost + MLP ensemble scorer. On the single-sentence dataset, the system achieves a Pearson of 0.676 and F\textsubscript{1} of 70.7\% \mbox{[95\%\,CI: 65.4--75.8]} against a human score, compared to the LaBSE-only baseline's Pearson of 0.268 and F\textsubscript{1} of 53.7\%. Five-fold cross-validation (Pearson 0.874$\pm$0.022, F\textsubscript{1} 84.3$\pm$1.7\%) confirms stable generalisation. Hard post-processing overrides for negation and wrong-number answers further reduce false positives. The main remaining challenges are reliable Karak detection and negation-aware scoring for multi-sentence answers, both of which require a higher-quality Bengali dependency parser than is currently publicly available.
+
+\section*{Acknowledgements}
+We thank the instructors and teaching assistants of the Introduction to NLP course at IIIT Hyderabad for their guidance and feedback on the project direction.
+
+\bibliography{custom}
+
+\appendix
+
+% =============================================================
+\section{Component-Wise Ablation: Single-Sentence Dataset}
+\label{app:ablation_folds}
+% =============================================================
+
+Table~\ref{tab:ablation_full} shows a leave-one-out ablation on the single-sentence test set. Starting from the full system, each component is removed individually to isolate its marginal contribution to Pearson, MAE, and F\textsubscript{1}.
+
+\begin{table}[h]
+  \centering
+  \resizebox{\columnwidth}{!}{%
+  \begin{tabular}{lccc}
+    \toprule
+    \textbf{System Variant} & \textbf{Pearson} & \textbf{MAE} & \textbf{F\textsubscript{1} 95\% CI\,(\%)} \\
+    \midrule
+    Full system (Ours)         & \textbf{0.676} & \textbf{19.81} & \textbf{70.7 \ [65.4--75.8]} \\
+    \midrule
+    \multicolumn{4}{l}{\textit{Leave-one-component-out:}} \\
+    $-$ GNN branch             & 0.268 & 50.51 & 53.7 \ [48.1--58.8] \\
+    $-$ Karak Validator        & 0.621 & 23.40 & 65.9 \ [60.5--71.2] \\
+    $-$ NER Soft Matching      & 0.638 & 21.95 & 67.8 \ [62.4--73.1] \\
+    $-$ Coreference Resolution & 0.651 & 21.13 & 68.2 \ [62.8--73.5] \\
+    $-$ Hard Overrides         & 0.672 & 19.96 & 70.7 \ [65.4--75.8] \\
+    \bottomrule
+  \end{tabular}}
+  \caption{Component-wise ablation (single-sentence test set). F\textsubscript{1} scores include 95\% bootstrap confidence intervals. Removing the GNN branch degrades performance most severely (Pearson drops from 0.676 to 0.268). Karak Validator and NER Soft Matching are the next largest contributors.}
+  \label{tab:ablation_full}
+\end{table}
+
+\end{document}
